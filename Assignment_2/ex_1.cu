@@ -9,5 +9,6 @@ __global__ void helloKernel()
 int main()
 {
   helloKernel<<<1, 256>>>();
+  cudaDeviceSynchronize();
   return 0;
 }
