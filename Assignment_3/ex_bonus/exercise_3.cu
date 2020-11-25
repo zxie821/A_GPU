@@ -1,16 +1,17 @@
 #include <cuda.h>
 #include <stdio.h>
 #include <curand.h>
-#include <sys/time.h>
+#include <time.h>
 #include <errno.h>
-#include <unistd.h>
+#include <io.h>
 #include <cublas_v2.h>
+#include <iostream>
 
 #ifndef TILE_SIZE
 #define TILE_SIZE 16
 #endif
 
-#define THRESHOLD 1e-3
+#define THRESHOLD 1e-1
 
 /* CUDA layout */
 dim3 grid(1);
@@ -38,11 +39,14 @@ void checkGpuError(cudaError_t result, char const *const func, const char *const
 	} while(0); \
 }
 
-/* time diff in ms */
-double elapsed(struct timeval t0, struct timeval t1)
-{
-	return (double)(t1.tv_sec - t0.tv_sec) * 1000.0L + (double)(t1.tv_usec - t0.tv_usec) / 1000.0L;
-}
+/**
+ * Calculates the elapsed time between two time intervals (in milliseconds).
+ * using: https://stackoverflow.com/questions/17250932/how-to-get-the-time-elapsed-in-c-in-milliseconds-windows;
+ */
+ double elapsed(clock_t t0, clock_t t1)
+ {
+     return ((double)t1 - t0) / CLOCKS_PER_SEC * 1000;
+ }
 
 /* compare matrix with abs difference */
 void compare_matrix(float *matrix_a, float *matrix_b, long size, double threshold)
@@ -76,9 +80,9 @@ void init_matrix(float *matrix, long size, unsigned long long seed)
 /* C = AB on CPU with re-ordered loop */
 void cpu_sgemm(float *C, float *A, float *B, long size)
 {
-	struct timeval t0, t1;
+	clock_t t0, t1;
 
-	gettimeofday(&t0, NULL);
+  t0 = clock();
 
 	for (long i = 0; i < size; i++) {
 		for (long k = 0; k < size; k++) {
@@ -88,7 +92,7 @@ void cpu_sgemm(float *C, float *A, float *B, long size)
 		}
 	}
 
-	gettimeofday(&t1, NULL);
+  t1 = clock();
 
 	printf("CPU matmul:\t\t\t%f ms\n", elapsed(t0, t1));
 }
@@ -114,12 +118,12 @@ void naive_sgemm_kernel(float *C, float *A, float *B, long size)
 /* matmul with global memory */
 void naive_sgemm(float *C, float *A, float *B, long size)
 {
-	struct timeval t0, t1;
-	gettimeofday(&t0, NULL);
+	clock_t t0, t1;
+  t0 = clock();
 	naive_sgemm_kernel<<<grid, block>>>(C, A, B, size);
 	checkCudaErrors(cudaPeekAtLastError());
-	checkCudaErrors(cudaDeviceSynchronize());
-	gettimeofday(&t1, NULL);
+  checkCudaErrors(cudaDeviceSynchronize());
+  t1 = clock();
 
 	printf("GPU matmul (global memory):\t%f ms\n", elapsed(t0, t1));
 }
@@ -133,6 +137,8 @@ void shared_sgemm_kernel(float *C, float *A, float *B, long size)
 	float val = 0.0;
 
 	/* TODO declare shared memory with size TILE_SIZE x TILE_SIZE */
+  __shared__ float tile_A[TILE_SIZE][TILE_SIZE];
+  __shared__ float tile_B[TILE_SIZE][TILE_SIZE];
 
 	if (col < size && row < size) {
 		const long local_col = blockIdx.x * TILE_SIZE + threadIdx.x;
@@ -143,9 +149,12 @@ void shared_sgemm_kernel(float *C, float *A, float *B, long size)
 			tile_B[threadIdx.y][threadIdx.x] = B[(m * TILE_SIZE + threadIdx.y) * size + local_col];
 			__syncthreads();
 	
-			/* TODO introduce a pragma directive that can potentially improve performance here */
+      /* TODO introduce a pragma directive that can potentially improve performance here */
+      /*reference: https://www.ibm.com/support/knowledgecenter/SSLTBW_2.2.0/com.ibm.zos.v2r2.cbcpx01/optpragm.htm*/
+      #pragma unroll
 			for (long k = 0; k < TILE_SIZE; ++k) {
-				/* TODO Perform multiplication here */
+        /* TODO Perform multiplication here */
+        val += tile_A[threadIdx.y][k] * tile_B[k][threadIdx.x];
 			}
 			__syncthreads();
 		}
@@ -157,12 +166,12 @@ void shared_sgemm_kernel(float *C, float *A, float *B, long size)
 /* matmul with shared memory */
 void shared_sgemm(float *C, float *A, float *B, long size)
 {
-	struct timeval t0, t1;
-	gettimeofday(&t0, NULL);
+  clock_t t0, t1;
+  t0 = clock();
 	shared_sgemm_kernel<<<grid, block>>>(C, A, B, size);
 	checkCudaErrors(cudaPeekAtLastError());
-	checkCudaErrors(cudaDeviceSynchronize());
-	gettimeofday(&t1, NULL);
+  checkCudaErrors(cudaDeviceSynchronize());
+  t1 = clock();
 
 	printf("GPU matmul (shared memory):\t%f ms\n", elapsed(t0, t1));
 }
@@ -170,18 +179,20 @@ void shared_sgemm(float *C, float *A, float *B, long size)
 /* cuBLAS */
 void cublas_sgemm(float *C, float *A, float *B, long size)
 {
-	struct timeval t0, t1;
+	clock_t t0, t1;
 	float alpha = 1.0;
 	float beta = 0.0;
 
 	cublasHandle_t handle;
 	cublasCreate(&handle);
 
-	gettimeofday(&t0, NULL);
-	/* TODO fill in the blanks, do C = BA instead of C = AB */
-	cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, , , , , , , , , , , );
-	checkCudaErrors(cudaDeviceSynchronize());
-	gettimeofday(&t1, NULL);
+  t0 = clock();
+  /* TODO fill in the blanks, do C = BA instead of C = AB */
+  cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, 
+              size, size, size, &alpha, 
+              B, size, A, size, &beta, C, size);
+  checkCudaErrors(cudaDeviceSynchronize());
+  t1 = clock();
 	cublasDestroy(handle);
 
 	printf("GPU cuBLAS matmul:\t\t%f ms\n", elapsed(t0, t1));
@@ -198,24 +209,27 @@ int main(int argc, char *argv[])
 	long size = 64;
 	bool verify = false;
 
-	while ((opt = getopt(argc, argv, "s:v")) != -1) {
-		switch (opt) {
-			case 's':
-				size = atol(optarg);
-				if (size % TILE_SIZE != 0) {
-					fprintf(stderr, "Error: Matrix size must be a multiple of tile size %d.\n", TILE_SIZE);
-					exit(1);
-				}
-				break;
-			case 'v':
-				verify = true;
-				printf("Matrix size: %ldx%ld\n", size, size);
-				break;
-			default:
-				print_usage(argv[0]);
-				exit(1);
-		}
-	}
+	// while ((opt = getopt(argc, argv, "s:v")) != -1) {
+	// 	switch (opt) {
+	// 		case 's':
+	// 			size = atol(optarg);
+	// 			if (size % TILE_SIZE != 0) {
+	// 				fprintf(stderr, "Error: Matrix size must be a multiple of tile size %d.\n", TILE_SIZE);
+	// 				exit(1);
+	// 			}
+	// 			break;
+	// 		case 'v':
+	// 			verify = true;
+	// 			printf("Matrix size: %ldx%ld\n", size, size);
+	// 			break;
+	// 		default:
+	// 			print_usage(argv[0]);
+	// 			exit(1);
+	// 	}
+  // }
+  std::cin>>size >> opt;
+  if(opt>0)
+    verify = true;
 
 	grid = dim3(((size + (TILE_SIZE - 1)) / TILE_SIZE), ((size + (TILE_SIZE - 1)) / TILE_SIZE));
 
@@ -267,7 +281,6 @@ int main(int argc, char *argv[])
 	else {
 		checkCudaErrors(cudaMemcpy(C_truth, d_C, sizeof(float)*size*size, cudaMemcpyDeviceToHost));
 	}
-
 	/* run naive gpu gemm */
 	checkCudaErrors(cudaMemset(d_C, 0, sizeof(float)*size*size));
 	naive_sgemm(d_C, d_A, d_B, size);
